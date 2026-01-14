@@ -19,6 +19,7 @@
   },
   "throttle_action": {
     "strategy": "pause_resume",     
-    "delete_files": true     
+    "delete_files": true,
+    "exclude_categories": "keep,ssd..."
   }
 }
