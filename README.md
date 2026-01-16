@@ -8,7 +8,7 @@
 
 ---
 
-# docker compose 已构建版本部署参考 
+# docker compose 已构建版本部署参考  目前未更新
 ```https://hub.docker.com/r/aksviolet/netcup-control-restapi```
 
 构建 ```docker build -t netcup-control-restapi .```
