@@ -42,6 +42,93 @@ class QBittorrentClient:
         except Exception:
             return False
 
+    def _is_torrent_completed(self, torrent) -> bool:
+        """
+        判断种子是否已完成下载
+        
+        Args:
+            torrent: 种子对象
+            
+        Returns:
+            bool: True 表示已完成，False 表示下载中
+        """
+        # qBittorrent 的完成状态包括：
+        # - uploading: 上传中（已完成下载）
+        # - stalledUP: 做种中（已完成下载）
+        # - pausedUP: 暂停的完成任务
+        # - queuedUP: 排队上传
+        # - checkingUP: 校验中（已完成）
+        # - forcedUP: 强制上传中
+        completed_states = [
+            'uploading', 'stalledUP', 'pausedUP', 
+            'queuedUP', 'checkingUP', 'forcedUP'
+        ]
+        
+        state = torrent.state.lower()
+        is_completed = any(s.lower() in state for s in completed_states)
+        
+        # 也可以通过进度判断（双重保险）
+        is_100_percent = torrent.progress >= 1.0
+        
+        return is_completed or is_100_percent
+
+    def _categorize_torrents(self, exclude_categories: list[str] | None = None):
+        """
+        将种子分类为：下载中（待删除）、已完成待暂停、已完成需排除
+        
+        Args:
+            exclude_categories: 要排除的分类列表
+            
+        Returns:
+            dict: {
+                'to_delete': [],      # 下载中的种子（不在排除分类中）
+                'to_pause': [],       # 已完成的种子（不在排除分类中）
+                'to_exclude': []      # 排除分类中的所有种子
+            }
+        """
+        try:
+            all_torrents = self.client.torrents.info()
+            
+            result = {
+                'to_delete': [],    # 下载中的种子（需删除）
+                'to_pause': [],     # 已完成的种子（需暂停）
+                'to_exclude': []    # 排除分类的种子（不操作）
+            }
+            
+            exclude_categories = exclude_categories or []
+            
+            for torrent in all_torrents:
+                torrent_category = torrent.category or ""
+                is_completed = self._is_torrent_completed(torrent)
+                
+                # 1. 如果在排除分类中，直接跳过
+                if torrent_category in exclude_categories:
+                    result['to_exclude'].append(torrent)
+                    logger.debug(f"排除种子 [{torrent.name}] - 分类: {torrent_category}, 状态: {torrent.state}")
+                    continue
+                
+                # 2. 未完成的种子 -> 待删除
+                if not is_completed:
+                    result['to_delete'].append(torrent)
+                    logger.debug(f"标记删除 [{torrent.name}] - 下载中, 进度: {torrent.progress*100:.1f}%, 状态: {torrent.state}")
+                # 3. 已完成的种子 -> 待暂停
+                else:
+                    result['to_pause'].append(torrent)
+                    logger.debug(f"标记暂停 [{torrent.name}] - 已完成, 状态: {torrent.state}")
+            
+            logger.info(
+                f"种子分类完成 - "
+                f"待删除(下载中): {len(result['to_delete'])}, "
+                f"待暂停(已完成): {len(result['to_pause'])}, "
+                f"排除: {len(result['to_exclude'])}"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"分类种子失败: {e}")
+            return {'to_delete': [], 'to_pause': [], 'to_exclude': []}
+
     def _get_torrents_excluding_categories(self, exclude_categories: list[str] | None = None):
         """
         获取所有种子，但排除指定分类的种子。
@@ -284,6 +371,90 @@ class QBittorrentClient:
 
         except Exception as e:
             logger.error(f"恢复种子失败: {e}")
+
+    def smart_throttle_action(
+        self, 
+        *, 
+        strategy: str = 'delete',
+        delete_files: bool = False, 
+        exclude_categories: list[str] | None = None
+    ) -> None:
+        """
+        智能限速操作：
+        1. 删除所有下载中的种子（排除指定分类）
+        2. 根据策略处理已完成的种子
+        
+        Args:
+            strategy: 'delete' 或 'pause_resume'
+            delete_files: True 时会连同本地数据一并删除（危险操作）
+            exclude_categories: 要排除的分类列表
+        """
+        logger.info(f"开始执行智能限速操作 - 策略: {strategy}")
+        
+        # 1. 先强制汇报所有种子（排除指定分类）
+        logger.info("步骤1: 强制汇报所有种子")
+        self.reannounce_all(exclude_categories=exclude_categories)
+        
+        # 2. 分类种子
+        logger.info("步骤2: 分析种子状态")
+        categorized = self._categorize_torrents(exclude_categories=exclude_categories)
+        
+        to_delete = categorized['to_delete']
+        to_pause = categorized['to_pause']
+        to_exclude = categorized['to_exclude']
+        
+        # 3. 删除下载中的种子
+        if to_delete:
+            logger.info(f"步骤3: 删除 {len(to_delete)} 个下载中的种子")
+            action = "删除种子和文件" if delete_files else "删除种子(保留文件)"
+            success_count = 0
+            
+            for torrent in to_delete:
+                try:
+                    self.client.torrents_delete(
+                        delete_files=delete_files,
+                        torrent_hashes=torrent.hash
+                    )
+                    success_count += 1
+                    logger.info(f"  ✓ {action}: [{torrent.name}] (进度: {torrent.progress*100:.1f}%)")
+                except Exception as e:
+                    logger.error(f"  ✗ 删除失败 [{torrent.name}]: {e}")
+            
+            logger.info(f"删除完成: {success_count}/{len(to_delete)} 个种子")
+        else:
+            logger.info("步骤3: 没有下载中的种子需要删除")
+        
+        # 4. 根据策略处理已完成的种子
+        if strategy == 'pause_resume':
+            if to_pause:
+                logger.info(f"步骤4: 暂停 {len(to_pause)} 个已完成的种子")
+                success_count = 0
+                
+                for torrent in to_pause:
+                    try:
+                        self.client.torrents_pause(torrent_hashes=torrent.hash)
+                        success_count += 1
+                        logger.info(f"  ✓ 暂停种子: [{torrent.name}]")
+                    except Exception as e:
+                        logger.error(f"  ✗ 暂停失败 [{torrent.name}]: {e}")
+                
+                logger.info(f"暂停完成: {success_count}/{len(to_pause)} 个种子")
+            else:
+                logger.info("步骤4: 没有已完成的种子需要暂停")
+        else:
+            logger.info(f"步骤4: 策略为 '{strategy}'，保留 {len(to_pause)} 个已完成的种子")
+        
+        # 5. 总结
+        if to_exclude:
+            logger.info(f"排除分类种子: {len(to_exclude)} 个未进行任何操作")
+        
+        logger.info(
+            f"智能限速操作完成 - "
+            f"已删除: {len(to_delete)}, "
+            f"已暂停: {len(to_pause) if strategy == 'pause_resume' else 0}, "
+            f"已保留: {len(to_pause) if strategy == 'delete' else 0}, "
+            f"已排除: {len(to_exclude)}"
+        )
 
     def pause_and_delete_all(self, *, delete_files: bool = False, exclude_categories: list[str] | None = None) -> None:
         """
