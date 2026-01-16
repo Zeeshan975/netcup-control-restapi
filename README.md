@@ -70,7 +70,9 @@ ACCOUNTS = [
     "chat_id": "你的chat_id请修改"
   },
   "throttle_action": {
-    "strategy": "pause_resume", #这里代表执行操作是 pause_resume pause delete   字面意思就是限速后暂停汇报 暂停汇报然后恢复后继续 直接删除
-    "delete_files": true  #仅delete时生效
+    "strategy": "pause_resume",     
+    "delete_files": true,
+    "exclude_categories": "keep,ssd..."
   }
 }
+```
